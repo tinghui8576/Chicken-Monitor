@@ -5,76 +5,19 @@ import csv
 import cv2
 import torch
 import os
-import torch.backends.cudnn as cudnn
-from numpy import random
 import numpy as np
+
+from numpy import random
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized, TracedModel
-from utils.quantify import cal_NNI
+from utils.quantify import cal_NNI, cal_optical_flow
+from utils.calibration import calibrate_map, calibrate_img, calibrate_pts
 
-def calculate_optical_flow(prev_gray, next_gray):
-    # define parameters for optical flow calculation
-    pyr_scale = 0.5
-    levels = 1
-    winsize = 80
-    iterations = 1
-    poly_n = 5
-    poly_sigma = 1.1
-    flags = 0
-    flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, pyr_scale, levels, winsize, iterations, poly_n, poly_sigma, flags)
-    # convert optical flow to polar coordinates
-    magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    return np.sum(magnitude)
 
-def calibration(pts, img, iorp=True):
-    DIM = np.load('cal_parameters_L/DIM.npy')
-    k = np.load('cal_parameters_L/K.npy')
-    d= np.load('cal_parameters_L/D.npy')
-    
-    # Just by scaling the matrix coefficients!
-    nk = k.copy()
-    nk[0,0]=k[0,0]/2
-    nk[1,1]=k[1,1]/2
-    DIM = tuple(DIM)
-    map1, map2 = cv2.fisheye.initUndistortRectifyMap(k, d, np.eye(3), nk, DIM, cv2.CV_32FC1)  # Pass k in 1st parameter, nk in 4th parameter
-    
-    # Calibrate points
-    if iorp == True:
-        idloc = []
-        idloc2 = []
-        for pt in pts:
-            pt1 = []
-            pt2 = []
-            pt1.append(int(pt[0]))
-            pt1.append(int(pt[1]))
-            idloc.append(pt1)
-            pt2.append(int(pt[2]))
-            pt2.append(int(pt[3]))
-            idloc2.append(pt2)
-        idloc = np.asarray(idloc, dtype=float)
-        idloc2 = np.asarray(idloc2, dtype=float)
-        idloc = np.expand_dims(idloc, 1)   
-        idloc2 = np.expand_dims(idloc2, 1)
-      
-        dst = cv2.fisheye.undistortPoints(idloc, k, d, cv2.CV_16SC2, P = nk)  # Pass k in 1st parameter, nk in 4th parameter
-        idloc2 = cv2.fisheye.undistortPoints(idloc2, k, d, cv2.CV_16SC2, P = nk)  # Pass k in 1st parameter, nk in 4th parameter  
-        dst = dst.squeeze()
-        idloc2 = idloc2.squeeze()
-        dst = np.hstack((dst, idloc2))  
-        dst = torch.from_numpy(dst)
-        
-        return dst
-    # Calibrate img
-    else:
-        nemImg = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        return nemImg
-
-   
-    
 def detect(save_img=False):
     start = time.time()
     nni = 0
@@ -84,6 +27,12 @@ def detect(save_img=False):
     width1 = 1920
     height1 = 1080
     
+    # Calibration 
+    # ==========================================================================================================================================================
+    map1, map2 = calibrate_map()
+    # ==========================================================================================================================================================
+
+
     # Load the model 
     # ==========================================================================================================================================================
     source, weights, view_img, save_txt, imgsz, trace = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size, not opt.no_trace
@@ -122,13 +71,13 @@ def detect(save_img=False):
     # ==========================================================================================================================================================
     
     
-    # Load the first image for optical flow
+    # Load the first image & calibrate for optical flow
     # ==========================================================================================================================================================
     path_list = os.listdir(source)
     img_file = os.path.join(source, path_list[0])
     
     prev_frame = cv2.imread(img_file)
-    prev_frame = calibration([],prev_frame,False)
+    prev_frame = calibrate_img(prev_frame, map1, map2)
     prev_frame = cv2.resize(prev_frame, (480,270))
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     
@@ -157,13 +106,17 @@ def detect(save_img=False):
             if img is None:
                 time.sleep(15)
                 break
-                
-            curr_frame = calibration([],im0s,False)
+            
+            # Load the next image & calibrate for optical flow
+            # =======================================================================================================================================================    
+            curr_frame prev_frame = calibrate_img(im0s, map1, map2)
             curr_frame = cv2.resize(curr_frame, (480,270))
             curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
             
             move = calculate_optical_flow(prev_gray, curr_gray)
             os.remove(path)
+            # ======================================================================================================================================================= 
+
             if pm != m:
                 #  Detect and calculate NNI
                 # ===================================================================================================================================================   
@@ -201,22 +154,38 @@ def detect(save_img=False):
                     if len(det):
                         # Rescale boxes from img_size to im0 size
                         det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-                        det[:, :4]  = calibration(det[:, :4], [], True)
+
+                        # Calibrate points
+                        det[:, :4]  = torch.from_numpy(calibrate_pts(det[:, :4], map1, map2))
                         
                         dets = []
                         # Write results
                         for *xyxy, conf, cls in reversed(det):
                            dets.append([int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]), float(conf)]) 
-        
+                                
+
+                            # if save_txt:  # Write to file
+                            #     xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                            #     line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
+                            #     with open(txt_path + '.txt', 'a') as f:
+                            #         f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                                        
+                            # if save_img or view_img:  # Add bbox to image
+                            #     label = f'{names[int(cls)]} {conf:.2f}'
+                            #     plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=1)
+
                         dets = np.asarray(dets)
-                        #print(len(dets))
+
+                        # Calculate NNI
                         if len(dets) > 2:
                           nni = cal_NNI(dets[:, :2], width1, height1)
                           
                           
                     # Print time (inference + NMS)
                     print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
-                # ===================================================================================================================================================    
+                # ===================================================================================================================================================   
+
+
                 if len(moves) != 0: 
                     movement = sum(moves)/len(moves)
                     print("avg", sum(moves)/len(moves))
